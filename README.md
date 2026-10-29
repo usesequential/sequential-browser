@@ -15,7 +15,20 @@ from one call. The code is `sequential.js`, the file that the Sequential script 
 npm install @usesequential/browser
 ```
 
-Copy the project's **sequential** key (`sq_sequential_…`) and the API host from **Setup** in Sequential.
+You need the project's **sequential** key (`sq_sequential_…`) and the API host, `https://api.usesequential.com`:
+
+- **You have a Sequential project:** copy them from **Setup** in Sequential.
+- **No account yet (for example, a coding agent installing this for someone):** create a trial with one call. No
+  account is needed. The answer's `ingest_key` is the key; the person claims the trial from an email within 72 hours.
+  Until then, the trial accepts events only from `localhost`.
+
+  ```bash
+  curl -X POST https://api.usesequential.com/api/agent/provision \
+    -H 'content-type: application/json' \
+    -d '{"owner_email": "person@example.com", "platform": "web"}'
+  ```
+
+  Details: [Let your agent set up a trial](https://www.usesequential.com/docs/agent-trial).
 
 ## Start it
 
