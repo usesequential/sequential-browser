@@ -1,6 +1,6 @@
 {
   "name": "@usesequential/browser",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "The Sequential browser SDK as an npm package: analytics and session replay, the same code as the script tag.",
   "keywords": [
     "sequential",

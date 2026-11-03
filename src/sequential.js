@@ -201,15 +201,20 @@
     logError('data-release is not a release (1 to 64 printable ASCII characters); events are sent without one.');
   }
 
-  // No key or no API: every method stays present and inert, so a bad tag never throws.
+  // No key or no API: every method stays present and inert, so a bad tag never throws. Both lines say how to set the
+  // values without attributes, for a loader that drops them.
   var DISABLED = false;
+  var CONFIG_HELP =
+    ' Loaded through Google Tag Manager or another loader that drops data-* attributes? Set window.sequentialConfig' +
+    ' = { key, api } before the SDK loads: https://www.usesequential.com/docs/sequential#configure-without-attributes';
   if (!KEY) {
-    logError('the script tag has no data-key — no events will be sent.');
+    logError('the script tag has no data-key — no events will be sent.' + CONFIG_HELP);
     DISABLED = true;
   } else if (!API_HOST) {
     logError(
       'the script tag has no data-api — no events will be sent. The CDN origin is not the ' +
-        'ingest origin, so it cannot be guessed from this script’s own src.'
+        'ingest origin, so it cannot be guessed from this script’s own src.' +
+        CONFIG_HELP
     );
     DISABLED = true;
   }
@@ -240,13 +245,16 @@
   var REQUEST_TIMEOUT_MS = 10000;
   var MAX_SEND_ATTEMPTS = 3;
   var RETRY_BASE_MS = 500;
-  // A 429 (the backend's per-project event rate limit): pause for the server's retry time, clamped; hold the refused
-  // batch and what is captured meanwhile, capped, the oldest dropped first (sequential.core.ts holdRateLimited).
+  // A 429 (the backend's per-project event rate limit) or a 503 overloaded (load shed; ClickHouse down): pause for the
+  // server's retry time, clamped; hold the refused batch whole and what is captured meanwhile, capped, the oldest dropped
+  // first. A held batch is resent after each pause, as its own request, until 5 min after its first refusal
+  // (sequential.core.ts holdRateLimited).
   var RATE_LIMIT_DEFAULT_SEC = 60;
   var RATE_LIMIT_MIN_SEC = 1;
   var RATE_LIMIT_MAX_SEC = 300;
   var MAX_HELD_EVENTS = 100;
   var MAX_HELD_BYTES = 128 * 1024;
+  var MAX_HOLD_MS = 5 * 60 * 1000;
 
   var redactor = null;
 
@@ -261,14 +269,16 @@
   // out, so a queued optOut() also writes nothing. Meanwhile each write waits in `held` (null removes).
   var storageOn = false;
   var held = {};
-  // What optOut() deletes: every key the SDK writes, except the __sq_opt mark it then sets.
+  // What optOut() deletes: every key the SDK writes, except the __sq_opt mark it then sets, and the recorder's
+  // __lx_replay_sample (recorder-boot.js sampledIn: '1:' or '0:' + the session id, written when sampling < 1).
   var STORED_KEYS = [
     ['localStorage', '__sq_did'],
     ['localStorage', '__sq_aid'],
     ['localStorage', '__sq_ath'],
     ['localStorage', '__sq_ith'],
     ['sessionStorage', '__sq_sid'],
-    ['sessionStorage', '__lx_replay_sid']
+    ['sessionStorage', '__lx_replay_sid'],
+    ['sessionStorage', '__lx_replay_sample']
   ];
 
   // False only when the browser refused the write.
@@ -600,8 +610,13 @@
   var queueBytes = 0;
   var flushTimer = null;
   var pauseTimer = null;
-  // Events already put back once after a 429 (a batch is resent once). An array, not a WeakSet: this file is ES5.
-  var resentOnce = [];
+  // Refused batches, oldest first, each kept whole and resent one request each: the backend sees the same ids again and
+  // stores a batch that did land once (BE src/ingest/dedup.ts).
+  var heldBatches = [];
+  // When each held event was first refused, as two parallel arrays (not a WeakMap: this file is ES5), at most
+  // 2 x MAX_HELD_EVENTS long: more than can be held at once.
+  var refusedEvents = [];
+  var refusedAt = [];
 
   function assign(target, source) {
     if (!source) return target;
@@ -707,6 +722,7 @@
     clearContextCookie();
     queue = [];
     queueBytes = 0;
+    heldBatches = [];
     clearFlushTimer();
     if (pauseTimer !== null) {
       clearTimeout(pauseTimer);
@@ -750,25 +766,48 @@
     }
   }
 
+  // Drop the oldest waiting events (held batches first, then the queue) until what waits fits the caps. Only while paused.
   function trimHeld() {
-    while (queue.length > MAX_HELD_EVENTS || (queue.length > 1 && queueBytes > MAX_HELD_BYTES)) {
-      queueBytes -= sizeOf(queue.shift());
+    var count = queue.length;
+    var bytes = queueBytes;
+    var i, j;
+    for (i = 0; i < heldBatches.length; i++) {
+      count += heldBatches[i].length;
+      for (j = 0; j < heldBatches[i].length; j++) bytes += sizeOf(heldBatches[i][j]);
+    }
+    while (count > MAX_HELD_EVENTS || (count > 1 && bytes > MAX_HELD_BYTES)) {
+      var dropped;
+      if (heldBatches.length > 0) {
+        dropped = heldBatches[0].shift();
+        if (heldBatches[0].length === 0) heldBatches.shift();
+      } else {
+        dropped = queue.shift();
+        queueBytes -= sizeOf(dropped);
+      }
+      count--;
+      bytes -= sizeOf(dropped);
     }
   }
 
   function holdRateLimited(events, sec) {
     if (stopped) return;
-    var again = [];
+    var now = Date.now();
+    var keep = [];
     for (var i = 0; i < events.length; i++) {
-      if (resentOnce.indexOf(events[i]) === -1) {
-        again.push(events[i]);
-        resentOnce.push(events[i]);
+      var k = refusedEvents.indexOf(events[i]);
+      if (k === -1) {
+        refusedEvents.push(events[i]);
+        refusedAt.push(now);
+        keep.push(events[i]);
+      } else if (now - refusedAt[k] < MAX_HOLD_MS) {
+        keep.push(events[i]);
       }
     }
-    while (resentOnce.length > 2 * MAX_HELD_EVENTS) resentOnce.shift();
-    queue = again.concat(queue);
-    queueBytes = 0;
-    for (var j = 0; j < queue.length; j++) queueBytes += sizeOf(queue[j]);
+    while (refusedEvents.length > 2 * MAX_HELD_EVENTS) {
+      refusedEvents.shift();
+      refusedAt.shift();
+    }
+    if (keep.length > 0) heldBatches.unshift(keep);
     clearFlushTimer();
     if (pauseTimer !== null) clearTimeout(pauseTimer);
     pauseTimer = setTimeout(function () {
@@ -824,19 +863,30 @@
     });
   }
 
+  function sendEvents(events) {
+    if (!canSend()) return Promise.resolve();
+    var body = buildEnvelope(events);
+    if (body === null) return Promise.resolve();
+    return attemptSend(body, 1, events)['catch'](noop);
+  }
+
   function flush() {
     try {
-      if (queue.length === 0) return Promise.resolve();
+      if (queue.length === 0 && heldBatches.length === 0) return Promise.resolve();
       clearFlushTimer();
       // Paused by a 429: the pause's own timer flushes what is held when it ends.
       if (pauseTimer !== null) return Promise.resolve();
+      // Held batches first, each as it was refused; a refusal on the way pauses again and keeps the rest held.
+      if (heldBatches.length > 0) {
+        return sendEvents(heldBatches.shift()).then(function () {
+          if (pauseTimer !== null || stopped) return;
+          return flush();
+        });
+      }
       var events = queue;
       queue = [];
       queueBytes = 0;
-      if (!canSend()) return Promise.resolve();
-      var body = buildEnvelope(events);
-      if (body === null) return Promise.resolve();
-      return attemptSend(body, 1, events)['catch'](noop);
+      return sendEvents(events);
     } catch (e) {
       return Promise.resolve();
     }
@@ -845,9 +895,13 @@
   function drain() {
     try {
       if (optedOut || DISABLED || stopped) return null;
-      if (queue.length === 0) return null;
+      if (queue.length === 0 && heldBatches.length === 0) return null;
       clearFlushTimer();
-      var events = queue;
+      // The page is going: what is held goes in the one beacon too, oldest first.
+      var events = [];
+      for (var i = 0; i < heldBatches.length; i++) events = events.concat(heldBatches[i]);
+      events = events.concat(queue);
+      heldBatches = [];
       queue = [];
       queueBytes = 0;
       var body = buildEnvelope(events);
@@ -945,9 +999,18 @@
     for (i = 0; i < w.length; i++) if (w[i].length > 2 && inList(idWords, w[i])) return true;
   }
 
+  // Account UI (the element or one of its 3 nearest ancestors): a class, id or data-testid word `avatar`, `account` or
+  // `user-menu`, or an account-menu name with `profile` (profile-menu, profile-dropdown, profile-button, profile-avatar,
+  // my-profile, user-profile); or an aria-label that names an account menu (ACCOUNT_LABEL, on the trimmed, lowercased
+  // label with its spaces collapsed). `profile` alone is not account UI: it hid "Read my blog" (class profile-blog, nav
+  // "Contact and social profiles") on a customer site, 2026-10-26.
+  var ACCOUNT_WORD = /(\b|_)(avatar|account|user[-_]?menu|profile[-_](menu|dropdown|button|avatar)|(my|user)[-_]profile)(\b|_)/;
+  var ACCOUNT_LABEL = /^(account|user|profile)$|\b(my|your|open) (account|profile)\b|\b(user|account|profile)( navigation)? (menu|dropdown|options)\b/;
   function inAccountUi(node) {
     for (var i = 0; node && node.getAttribute && i++ < 4; node = node.parentNode) {
-      if (/(\b|_)(avatar|account|profile|user[-_]?menu)(\b|_)/.test((node.getAttribute('class') + ' ' + node.id + ' ' + node.getAttribute('data-testid')).toLowerCase()) || /account|profile|user/i.test(node.getAttribute('aria-label'))) return true;
+      if (ACCOUNT_WORD.test((node.getAttribute('class') + ' ' + node.id + ' ' + node.getAttribute('data-testid')).toLowerCase())) return true;
+      var label = String(node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').replace(/^ | $/g, '').toLowerCase();
+      if (label && ACCOUNT_LABEL.test(label)) return true;
     }
   }
 
@@ -960,23 +1023,32 @@
       learnIdentity(newDistinctId, props);
       var previous = distinctId;
       var hasTraits = props !== undefined && props !== null && typeof props === 'object' && Object.keys(props).length > 0;
-      var hash = hasTraits ? identifyHash(newDistinctId, props) : null;
+      // __sq_ith is written on every identify, with no traits too: a stored one says the stored id is a person's.
+      var hash = identifyHash(newDistinctId, hasTraits ? props : {});
+      var stored = readLocal(IDENTIFY_HASH_KEY, memoryIdentifyHash);
       if (previous === newDistinctId) {
-        // Same person again (a reload): changed traits still go out; the same traits, or none, send nothing.
-        if (hash === null || hash === readLocal(IDENTIFY_HASH_KEY, memoryIdentifyHash)) return;
+        // Same person again (a reload): changed traits still go out; the same traits, or none, send nothing. None
+        // keeps the stored hash, and writes one only where there is none (an id identified before ith was always set).
+        if (hasTraits ? hash === stored : stored !== null && stored !== undefined) return;
         memoryIdentifyHash = hash;
         writeLocal(IDENTIFY_HASH_KEY, hash);
-        captureInternal('$identify', assign({}, props));
+        if (hasTraits) captureInternal('$identify', assign({}, props));
         return;
       }
       memoryIdentifyHash = hash;
       writeLocal(IDENTIFY_HASH_KEY, hash);
       distinctId = newDistinctId;
       writeDistinctId(newDistinctId);
-      contextDistinctId = previous;
 
       var merged = assign({}, props);
-      merged.$anon_distinct_id = previous;
+      if (stored === null || stored === undefined) {
+        contextDistinctId = previous;
+        merged.$anon_distinct_id = previous;
+      } else {
+        // Another person on this browser (no reset): the previous id is a person, not an anonymous visitor, so it is
+        // no claim. Sent as one, it moved that person's history to this one (the People duplicate, 2026-10-23).
+        contextDistinctId = newDistinctId;
+      }
       captureInternal('$identify', merged);
     } catch (e) {}
   }
@@ -1045,6 +1117,7 @@
 
       queue = [];
       queueBytes = 0;
+      heldBatches = [];
       clearFlushTimer();
       clearContextCookie();
       forgetStorage();
@@ -1088,6 +1161,17 @@
       syncContextCookie();
     } catch (e) {}
   }
+
+  // Another tab's optOut() (the shared __sq_opt mark set to '1') opts this tab out at once: it stops sending, holds
+  // storage and does not write back the ids that tab deleted. Another tab's optIn() (the mark removed, newValue null)
+  // does NOT opt this tab in, and neither does localStorage.clear() (key null): opt-in takes effect from the next page
+  // load, for analytics and the recorder alike (mgmt 2026-10-23, as the recorder's 2026-10-17 ruling). optOut() here
+  // writes the same '1', which fires no further event.
+  try {
+    window.addEventListener('storage', function (e) {
+      if (e && e.key === OPT_OUT_KEY && e.newValue === '1' && !optedOut) optOut();
+    });
+  } catch (e) {}
 
   function captureException(error, props) {
     try {
@@ -1324,8 +1408,26 @@
       route = hashRouteOf(s.slice(hash));
       s = s.slice(0, hash);
     }
-    s = s.replace(/^([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^/?#@]*@/, '$1');
+    // userinfo runs to the authority's LAST '@' (an '@' in the user or password); never past '/', '?' or '#'
+    s = s.replace(/^([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^/?#]*@/, '$1');
     return rdct.boundedRedact(s + route, URL_MAX);
+  }
+
+  // A clicked link's target ($el_href, owner decision 2026-10-26): resolved against the page; a scheme other than http(s)
+  // is the scheme only, another origin its origin only (never another site's path), the page's own origin keeps the path
+  // with no query, fragment or userinfo. Ingest re-scrubs it and is the authority (BE: src/adapters/link-target-scrub.ts):
+  // id-like segments barred, the origin only under mask_attributes strict.
+  function linkTarget(raw) {
+    var page, target;
+    try {
+      page = new URL(String(window.location.href));
+      target = new URL(String(raw), page.href);
+    } catch (e) {
+      return undefined;
+    }
+    if (!/^https?:$/.test(target.protocol)) return target.protocol;
+    if (target.origin !== page.origin) return target.origin;
+    return target.origin + target.pathname;
   }
 
   function currentUrl() {
@@ -1410,6 +1512,17 @@
     try {
       var u = new URL(href);
       return u.pathname + u.search + (/^#!?\//.test(u.hash) ? u.hash : '');
+    } catch (e) {
+      return String(href);
+    }
+  }
+
+  // sequential.autocapture.ts pathKey: the page without its query (pathname + hash route). A replaceState that keeps
+  // it is not a pageview (2026-10-22): a player's ?t= or a list's ?sort= rewritten in place is the same page.
+  function pathKey(href) {
+    try {
+      var u = new URL(href);
+      return u.pathname + hashRouteOf(u.hash);
     } catch (e) {
       return String(href);
     }
@@ -1506,21 +1619,55 @@
     // route) for every trigger, as in
     // sequential.autocapture.ts pageKey: a router's same-URL replaceState is not a pageview.
     var lastPageKey = null;
+    var lastPathKey = null;
     var lastNavigationType;
     var navigationApi = false;
 
     function checkPage(nav) {
       try {
         lastNavigationType = undefined;
+        popKind = undefined;
         var key = pageKey(String(window.location.href));
         if (key === lastPageKey) return;
+        // A query-only replaceState moves both keys without a pageview (sequential.autocapture.ts checkPage).
+        var path = pathKey(String(window.location.href));
+        var queryOnlyReplace = nav === 'replace' && path === lastPathKey;
         lastPageKey = key;
+        lastPathKey = path;
+        if (queryOnlyReplace) return;
         capturePageview(undefined, nav);
       } catch (e) {}
     }
 
+    // A traversal the page's router answers with replaceState (sequential.autocapture.ts inPopstate, F1): a push or
+    // replace while a popstate is being handled (window.event, or our capture listener's mark) is that traversal, of
+    // the kind of the last navigate event before it that was not a replace.
+    var popPending = false;
+    var popKind;
+    function onPopCapture() {
+      try {
+        popPending = true;
+        setTimeout(function () {
+          popPending = false;
+        }, 0);
+      } catch (e) {}
+    }
+    function inPopstate() {
+      if (popPending) return true;
+      try {
+        var ev = window.event;
+        return !!ev && ev.type === 'popstate';
+      } catch (e) {
+        return false;
+      }
+    }
+    function hookNav(kind) {
+      return inPopstate() ? (navigationApi ? navFromNavigationType(popKind) : 'unknown') : kind;
+    }
+
     function onPopState() {
-      checkPage(navigationApi ? navFromNavigationType(lastNavigationType) : 'unknown');
+      checkPage(navigationApi ? navFromNavigationType(popKind) : 'unknown');
+      popPending = false;
     }
 
     // $click's props; $rageclick and $deadclick send the same, so the detector groups all three.
@@ -1530,12 +1677,23 @@
       var identity = DETECT_IDENTITY && raw !== undefined && (inAccountUi(matched) || namesPerson(raw));
       var noIds = closestMatching(matched, '[data-sq-private]') || (DETECT_IDENTITY && namesPerson(stableSelector(matched)));
       var selector = stableSelector(matched, noIds);
+      // $el_label (the aria-label) and $el_href (the link target, linkTarget) are element text like $el_text (owner
+      // decision 2026-10-26, soc2 rule): none under data-sq-mask/-private, in account UI, or when the text, the label or
+      // the target names the identified person; the label redacted and capped like the text. An icon button's label is
+      // often its only name.
+      var label = masked ? '' : String(matched.getAttribute('aria-label') || '').replace(/\s+/g, ' ').replace(/^ | $/g, '');
+      var anchor = masked ? null : closestMatching(matched, 'a[href]');
+      var href = anchor ? linkTarget(anchor.getAttribute('href')) : undefined;
+      var labelOrHrefIdentity = DETECT_IDENTITY && (label || href) &&
+        (identity || inAccountUi(matched) || (label && namesPerson(label)) || (href && namesPerson(href)));
       return {
         $el_tag_name: tagNameOf(matched),
         $el_selector: cap(selector, EL_SELECTOR_MAX),
         $el_id: matched.id && !noIds ? cap(String(matched.id), EL_ID_MAX) : undefined,
         $el_data: masked || identity ? undefined : dataAttrs(matched, redactor),
-        $el_text: raw !== undefined && !identity ? redactor.boundedRedact(raw, CLICK_TEXT_MAX) : undefined
+        $el_text: raw !== undefined && !identity ? redactor.boundedRedact(raw, CLICK_TEXT_MAX) : undefined,
+        $el_label: label && !labelOrHrefIdentity ? redactor.boundedRedact(label, CLICK_TEXT_MAX) : undefined,
+        $el_href: href && !labelOrHrefIdentity ? redactor.boundedRedact(href, URL_MAX) : undefined
       };
     }
 
@@ -1728,12 +1886,14 @@
     document.addEventListener('focusin', onFocusIn, true);
     document.addEventListener('selectionchange', onSelectionChange, true);
     document.addEventListener('scroll', onScroll, true);
+    window.addEventListener('popstate', onPopCapture, true);
     window.addEventListener('popstate', onPopState);
     try {
       var navigation = window.navigation;
       if (navigation && typeof navigation.addEventListener === 'function') {
         navigation.addEventListener('navigate', function (ev) {
           lastNavigationType = ev.navigationType;
+          if (ev.navigationType !== 'replace') popKind = ev.navigationType;
         });
         navigationApi = true;
       }
@@ -1746,20 +1906,21 @@
       if (typeof originalPush === 'function') {
         history.pushState = function () {
           var result = originalPush.apply(history, arguments);
-          checkPage('push');
+          checkPage(hookNav('push'));
           return result;
         };
       }
       if (typeof originalReplace === 'function') {
         history.replaceState = function () {
           var result = originalReplace.apply(history, arguments);
-          checkPage('replace');
+          checkPage(hookNav('replace'));
           return result;
         };
       }
     } catch (e) {}
 
     lastPageKey = pageKey(attachUrl || String(window.location.href));
+    lastPathKey = pathKey(attachUrl || String(window.location.href));
     capturePageview(attachUrl, 'load');
   }
 
