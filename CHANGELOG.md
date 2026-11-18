@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.3
+
+- A click that a script makes (`el.click()`, `dispatchEvent`; the browser marks it `isTrusted: false`) is recorded only
+  while the person acts: while the page has transient user activation, or within 1 second of the person's own
+  pointerup, touchend or keydown. So a tap or key that the page forwards as its own click (FastClick on iOS, a key
+  handler on a `role="button"`) is still recorded, and a script that clicks on a timer from page load is not: no
+  `$click` and no dead click. A browser that does not set `isTrusted` is unchanged.
+- At most 5 `$click` per element per second, on a monotonic clock. A faster loop on one element, even with events the
+  browser trusts, sends no more. Rage and dead clicks are unchanged.
+- A dead click on an option that was already selected carries `$el_state: 'selected'`.
+
 ## 1.0.2
 
 - The package now holds the same code as the script tag of 3 November 2026. Changes since 1.0.0:

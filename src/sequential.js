@@ -245,10 +245,7 @@
   var REQUEST_TIMEOUT_MS = 10000;
   var MAX_SEND_ATTEMPTS = 3;
   var RETRY_BASE_MS = 500;
-  // A 429 (the backend's per-project event rate limit) or a 503 overloaded (load shed; ClickHouse down): pause for the
-  // server's retry time, clamped; hold the refused batch whole and what is captured meanwhile, capped, the oldest dropped
-  // first. A held batch is resent after each pause, as its own request, until 5 min after its first refusal
-  // (sequential.core.ts holdRateLimited).
+  // A 429 or a 503 overloaded: pause and hold, as sequential.core.ts holdRateLimited.
   var RATE_LIMIT_DEFAULT_SEC = 60;
   var RATE_LIMIT_MIN_SEC = 1;
   var RATE_LIMIT_MAX_SEC = 300;
@@ -999,11 +996,11 @@
     for (i = 0; i < w.length; i++) if (w[i].length > 2 && inList(idWords, w[i])) return true;
   }
 
-  // Account UI (the element or one of its 3 nearest ancestors): a class, id or data-testid word `avatar`, `account` or
-  // `user-menu`, or an account-menu name with `profile` (profile-menu, profile-dropdown, profile-button, profile-avatar,
-  // my-profile, user-profile); or an aria-label that names an account menu (ACCOUNT_LABEL, on the trimmed, lowercased
-  // label with its spaces collapsed). `profile` alone is not account UI: it hid "Read my blog" (class profile-blog, nav
-  // "Contact and social profiles") on a customer site, 2026-10-26.
+  // Account UI (the element or its 3 nearest ancestors):
+  // as in sequential.autocapture.ts.
+  // `profile` alone is not
+  // account UI
+  // (2026-10-26).
   var ACCOUNT_WORD = /(\b|_)(avatar|account|user[-_]?menu|profile[-_](menu|dropdown|button|avatar)|(my|user)[-_]profile)(\b|_)/;
   var ACCOUNT_LABEL = /^(account|user|profile)$|\b(my|your|open) (account|profile)\b|\b(user|account|profile)( navigation)? (menu|dropdown|options)\b/;
   function inAccountUi(node) {
@@ -1162,11 +1159,11 @@
     } catch (e) {}
   }
 
-  // Another tab's optOut() (the shared __sq_opt mark set to '1') opts this tab out at once: it stops sending, holds
-  // storage and does not write back the ids that tab deleted. Another tab's optIn() (the mark removed, newValue null)
-  // does NOT opt this tab in, and neither does localStorage.clear() (key null): opt-in takes effect from the next page
-  // load, for analytics and the recorder alike (mgmt 2026-10-23, as the recorder's 2026-10-17 ruling). optOut() here
-  // writes the same '1', which fires no further event.
+  // Another tab's optOut() (__sq_opt set to '1') opts this tab out at once;
+  // it writes back none of the ids that tab deleted.
+  // Another tab's optIn() or localStorage.clear()
+  // does not opt this tab in:
+  // that waits for the next page load.
   try {
     window.addEventListener('storage', function (e) {
       if (e && e.key === OPT_OUT_KEY && e.newValue === '1' && !optedOut) optOut();
@@ -1582,15 +1579,19 @@
     return r.target.getAttribute(r.attributeName) !== r.oldValue;
   }
 
-  // The main button and no modifier key: anything else opens a menu, a tab or a selection. Not
-  // isPrimary: Chromium sends `click` as a PointerEvent with isPrimary=false; only pointer events
-  // check it (isPlainPointer).
+  // As sequential.autocapture.ts isPlainClick and isPlainPointer.
   function isPlainClick(ev) {
     return ev.button === 0 && !ev.ctrlKey && !ev.metaKey && !ev.shiftKey && !ev.altKey;
   }
 
   function isPlainPointer(ev) {
     return isPlainClick(ev) && ev.isPrimary !== false;
+  }
+
+  // Monotonic where there is one, so a step of the wall clock cannot freeze the $click cap's window.
+  function now() {
+    var p = window.performance;
+    return p && p.now ? p.now() : Date.now();
   }
 
   function startAutocapture(attachUrl) {
@@ -1615,9 +1616,7 @@
       });
     }
 
-    // One page key (pathname + search of the RAW URL, + the fragment only for a #/ or #!/ hash
-    // route) for every trigger, as in
-    // sequential.autocapture.ts pageKey: a router's same-URL replaceState is not a pageview.
+    // One page key for every trigger, as sequential.autocapture.ts pageKey.
     var lastPageKey = null;
     var lastPathKey = null;
     var lastNavigationType;
@@ -1639,9 +1638,7 @@
       } catch (e) {}
     }
 
-    // A traversal the page's router answers with replaceState (sequential.autocapture.ts inPopstate, F1): a push or
-    // replace while a popstate is being handled (window.event, or our capture listener's mark) is that traversal, of
-    // the kind of the last navigate event before it that was not a replace.
+    // A traversal the page's router answers with replaceState: as sequential.autocapture.ts inPopstate (F1).
     var popPending = false;
     var popKind;
     function onPopCapture() {
@@ -1697,20 +1694,41 @@
       };
     }
 
+    // At most 5 $click per element per second (sequential.autocapture.ts CLICK_CAP): capAt is the window's start, caps
+    // each element's count in it; the clicks past 5 are counted there, not sent.
+    var caps = {};
+    var capAt = 0;
+    // The last trusted pointerup, touchend or keydown (sequential.autocapture.ts GESTURE_MS).
+    var gestureAt = -1e9;
+
+    function onGesture(ev) {
+      if (ev.isTrusted) gestureAt = now();
+    }
+
     function onClick(ev) {
       try {
         var target = ev && ev.target;
         if (!target || target.nodeType !== 1) return;
+        // A script's click (isTrusted false) counts only while the person acts (sequential.autocapture.ts untrusted).
+        if (ev.isTrusted === false) {
+          var ua = window.navigator.userActivation;
+          if (!(ua && ua.isActive) && now() - gestureAt >= 1000) return;
+        }
         var matched = closestMatching(target, INTERACTIVE_SELECTOR);
         if (!matched) return;
-        captureInternal('$click', elementProps(matched));
+        var props = elementProps(matched);
+        var t = now();
+        if (t - capAt >= 1000) {
+          caps = {};
+          capAt = t;
+        }
+        if ((caps[props.$el_selector] = (caps[props.$el_selector] || 0) + 1) <= 5) captureInternal('$click', props);
         if (isPlainClick(ev) && !deadExcluded(matched, target)) openDead(matched);
       } catch (e) {}
     }
 
     // ── rage and dead clicks: as in sequential.autocapture.ts (BE spec 2026-10-08, BE #432) ──
-    // One MutationObserver, only while a burst or a dead window is open. No MutationObserver:
-    // neither signal runs, because "no effect" cannot be told from "an effect we cannot see".
+    // One MutationObserver, only while a burst or a dead window is open; none: neither signal runs.
     var Observer = window.MutationObserver;
     var rage = null;
     var dead = null;
@@ -1819,7 +1837,7 @@
       if (!Observer || document.visibilityState === 'hidden') return;
       // A new click means the person did something: the old window ends with no event.
       if (dead) clearTimeout(dead.timer);
-      dead = { at: Date.now(), el: el, href: String(window.location.href), timer: setTimeout(endDead, DEAD_WAIT_MS) };
+      dead = { at: Date.now(), el: el, href: String(window.location.href), selected: !closestMatching(el, '[data-sq-private]') && selectedState(el), timer: setTimeout(endDead, DEAD_WAIT_MS) };
       syncObserver();
     }
 
@@ -1830,7 +1848,7 @@
         syncObserver();
         if (!d || String(window.location.href) !== d.href) return;
         var props = elementProps(d.el);
-        props.$wait_ms = DEAD_WAIT_MS;
+        props.$wait_ms = DEAD_WAIT_MS; if (d.selected) props.$el_state = 'selected';
         captureInternal('$deadclick', props, d.at);
       } catch (e) {}
     }
@@ -1883,6 +1901,9 @@
     document.addEventListener('submit', onSubmit, true);
     document.addEventListener('pointerdown', onPointerDown, true);
     document.addEventListener('pointerup', onPointerUp, true);
+    document.addEventListener('pointerup', onGesture, true);
+    document.addEventListener('touchend', onGesture, true);
+    document.addEventListener('keydown', onGesture, true);
     document.addEventListener('focusin', onFocusIn, true);
     document.addEventListener('selectionchange', onSelectionChange, true);
     document.addEventListener('scroll', onScroll, true);
@@ -2064,6 +2085,17 @@
         }
       );
     } catch (e) {}
+  }
+
+  // F7: already selected when clicked (ARIA, or a class like is-active); only 'selected' is sent ($deadclick)
+  function selectedState(el) {
+    var v = el.getAttribute('aria-current');
+    return ['pressed', 'checked', 'selected'].some(function (a) { return /^\s*true\s*$/i.test(el.getAttribute('aria-' + a)); }) ||
+      (v !== null && !/^\s*(false)?\s*$/i.test(v)) ||
+      String(el.getAttribute('class') || '').toLowerCase().split(/\s+/).some(function (t) {
+        t = t.split(/--|__|[-_]/);
+        return /^(active|selected|checked|current|on)$/.test(t[t.length - 1]) && !t.some(function (x) { return /^(not|un|non|no)$/.test(x); });
+      });
   }
 
   if (!DISABLED) {
