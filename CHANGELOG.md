@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.4
+
+- The person's own pointerup, touchend or keydown is noted on the window, before any handler of the page runs. So a click
+  that a page's own key or tap handler makes at once (for example on a `role="button"`) is recorded, also on a browser
+  without `navigator.userActivation`, when that handler was added before the SDK.
+- On-screen messages (`$ui_message`), off unless the project is switched on by Sequential: for 3 seconds after a click,
+  a submit or an Enter, and once 1.5 seconds after a page load or route change, an announced message (`role="alert"`,
+  `role="status"`, `aria-live`), a control marked `aria-invalid`, or an error-styled line in a form is sorted into a class
+  from the project's patterns. Only the class and structure are sent (kind, tone, the form or section it is near, the
+  window, a length band), never the text or any hash of it. Nothing under `data-sq-private` or `data-sq-mask`. At most
+  one per message per 10 seconds, 10 per page view and 30 per minute.
+- An element id is sent only when it is a plain token (letters, digits, `_` and `-`, at most 128 characters), in
+  `$el_id`, the form's `form` and every selector. An id that holds text (a name, an order number, spaces), a generated
+  `:r1:` id, or a longer one counts as no id, so the selector is the id-less path. Dead-click and rage-click cases on such
+  controls start a new case once, from this release.
+
 ## 1.0.3
 
 - A click that a script makes (`el.click()`, `dispatchEvent`; the browser marks it `isTrusted: false`) is recorded only

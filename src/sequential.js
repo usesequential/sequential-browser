@@ -1299,6 +1299,12 @@
   var EL_DATA_VALUE_MAX = 128;
 
   var EL_ID_MAX = 128;
+  // An id is sent only as a token (letters, digits, '_', '-'; at most 128): an id holding text (a name, an order number,
+  // spaces) or a generated ':r1:' counts as no id, here and in every selector (design gate/mgr/ux-detection-2026-11-18/
+  // click-id-shape.md; the ingest gate holds old copies to the same rule).
+  function idToken(id) {
+    return typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id) ? id : '';
+  }
   var EL_SELECTOR_MAX = 256;
 
   var URL_MAX = 512;
@@ -1355,7 +1361,8 @@
     return !!closestMatching(el, '[data-sq-mask], [data-sq-private]');
   }
 
-  function subtreeText(el) {
+  // skip (the message detector's MSG_TYPED): also leave out what matches it, or what the browser says is editable.
+  function subtreeText(el, skip) {
     var out = '';
     function visit(node) {
       for (var child = node.firstChild; child !== null; child = child.nextSibling) {
@@ -1368,6 +1375,7 @@
         if (inList(TEXT_OPAQUE_TAGS, tagNameOf(child))) continue;
         if (isEditable(child)) continue;
         if (child.hasAttribute && (child.hasAttribute('data-sq-mask') || child.hasAttribute('data-sq-private'))) continue;
+        if (skip && (child.isContentEditable === true || matchesSelector(child, skip))) continue;
         visit(child);
       }
     }
@@ -1441,7 +1449,7 @@
     var node = el;
     var root = document.documentElement;
     while (node && node !== root && node.nodeType === 1) {
-      if (node.id && !noIds) {
+      if (!noIds && idToken(node.id)) {
         parts.unshift('#' + node.id);
         break;
       }
@@ -1491,6 +1499,12 @@
   }
 
   var autocaptureStarted = false;
+  var MSG_SEL = '[role=alert], [role=status], [aria-live=assertive], [aria-live=polite], [aria-invalid=true]';
+  var MSG_STYLED = /(^|[-_\s])(error|danger|invalid|alert|warning)([-_\s]|$)/i;
+  var MSG_CLASSES = /^(sign_in_again|already_exists|required|invalid_format|not_allowed|not_found|network|try_again|limit_reached|payment)$/;
+  // A control, or anything inside an editable region: what the visitor types, never read as a message.
+  var MSG_TYPED = 'input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role=textbox], [role=searchbox], [role=combobox], .ace_editor, .monaco-editor, .CodeMirror';
+  var uiMessages = null;
   // Set by startAutocapture: sends an open rage burst before the unload path drains the queue.
   var flushOpenSignals = noop;
 
@@ -1614,6 +1628,20 @@
         $nav: nav,
         $load_type: nav === 'load' ? loadTypeOf() : undefined
       });
+      if (msgRules) {
+        msgView = 0;
+        msgCapped = false;
+        msgSeen = {};
+        clearTimeout(msgScanTimer);
+        msgScanTimer = setTimeout(function () {
+          try {
+            msgBudget = 300;
+            msgExamined = typeof WeakMap === 'function' ? new WeakMap() : null;
+            var list = document.querySelectorAll(MSG_SEL);
+            for (var i = 0; i < list.length && msgBudget > 0; i++) msgFound(list[i], nav === 'load' ? 'load' : 'route');
+          } catch (e) {}
+        }, 1500);
+      }
     }
 
     // One page key for every trigger, as sequential.autocapture.ts pageKey.
@@ -1686,7 +1714,7 @@
       return {
         $el_tag_name: tagNameOf(matched),
         $el_selector: cap(selector, EL_SELECTOR_MAX),
-        $el_id: matched.id && !noIds ? cap(String(matched.id), EL_ID_MAX) : undefined,
+        $el_id: !noIds && idToken(matched.id) || undefined,
         $el_data: masked || identity ? undefined : dataAttrs(matched, redactor),
         $el_text: raw !== undefined && !identity ? redactor.boundedRedact(raw, CLICK_TEXT_MAX) : undefined,
         $el_label: label && !labelOrHrefIdentity ? redactor.boundedRedact(label, CLICK_TEXT_MAX) : undefined,
@@ -1702,7 +1730,10 @@
     var gestureAt = -1e9;
 
     function onGesture(ev) {
-      if (ev.isTrusted) gestureAt = now();
+      if (ev.isTrusted) {
+        gestureAt = now();
+        if (ev.key === 'Enter') openMsg('submit');
+      }
     }
 
     function onClick(ev) {
@@ -1714,6 +1745,7 @@
           var ua = window.navigator.userActivation;
           if (!(ua && ua.isActive) && now() - gestureAt >= 1000) return;
         }
+        openMsg('click');
         var matched = closestMatching(target, INTERACTIVE_SELECTOR);
         if (!matched) return;
         var props = elementProps(matched);
@@ -1736,10 +1768,10 @@
 
     function syncObserver() {
       try {
-        if ((rage || dead) && !observer && Observer) {
+        if ((rage || dead || now() < msgUntil) && !observer && Observer) {
           observer = new Observer(onMutations);
           observer.observe(document, { subtree: true, childList: true, attributes: true, attributeOldValue: true, characterData: true });
-        } else if (!rage && !dead && observer) {
+        } else if (!rage && !dead && now() >= msgUntil && observer) {
           observer.disconnect();
           observer = null;
         }
@@ -1767,6 +1799,20 @@
 
     function onMutations(records) {
       var own = true;
+      if (now() < msgUntil) {
+        for (var j = 0; j < records.length && j < 100 && msgBudget > 0; j++) {
+          var r = records[j];
+          msgFound(r.target.nodeType === 1 ? r.target : r.target.parentNode, msgAfter);
+          for (var k = 0; k < r.addedNodes.length; k++) {
+            var n = r.addedNodes[k];
+            if (n.nodeType !== 1) continue;
+            msgFound(n, msgAfter);
+            var inner = n.querySelectorAll(MSG_SEL);
+            for (var m = 0; m < inner.length && m < 20 && msgBudget > 0; m++) msgFound(inner[m], msgAfter);
+          }
+        }
+      }
+      if (!rage && !dead) return syncObserver();
       for (var i = 0; i < records.length; i++) {
         if (records[i].type !== 'attributes' || !rage || records[i].target !== rage.el || stateChanged(records[i])) own = false;
       }
@@ -1868,6 +1914,103 @@
       if ((dead || rage) && hasSelection()) effect(false);
     }
 
+    // ── on-screen messages: $ui_message (D1). Rule zero: the text is matched here against the project's patterns (from the
+    // config, off without them) and only the CLASS is sent; no text, no part of it, no hash of it.
+    var msgRules = null;
+    try {
+      if (uiMessages && uiMessages.patterns) {
+        msgRules = [];
+        for (var pi = 0; pi < uiMessages.patterns.length && pi < 50; pi++) {
+          try {
+            msgRules.push([String(uiMessages.patterns[pi][0]), new RegExp(String(uiMessages.patterns[pi][1]).slice(0, 300), 'i')]);
+          } catch (e) {}
+        }
+      }
+    } catch (e) {}
+    var msgUntil = 0;
+    var msgAfter;
+    var msgSeen = {};
+    var msgView = 0;
+    var msgTimes = [];
+    var msgCapped = false;
+    var msgBudget = 0;
+    var msgExamined = null;
+    var msgScanTimer;
+
+    // 3 s after a click, a submit or an Enter, what appears is read.
+    function openMsg(after) {
+      if (!msgRules) return;
+      msgUntil = now() + 3000;
+      msgAfter = after;
+      msgBudget = 300;
+      msgExamined = typeof WeakMap === 'function' ? new WeakMap() : null;
+      syncObserver();
+      setTimeout(syncObserver, 3001);
+    }
+
+    // The click selector's rules (an id only as a token: idToken).
+    function msgNear(el, noIds) {
+      var sel = stableSelector(el, noIds);
+      return DETECT_IDENTITY && namesPerson(sel) ? stableSelector(el, true) : sel;
+    }
+
+    function msgFound(el, after) {
+      try {
+        if (!msgRules || !el || el.nodeType !== 1 || msgBudget-- <= 0) return;
+        var m = closestMatching(el, MSG_SEL);
+        if (!m && MSG_STYLED.test(el.getAttribute('class') || '') && closestMatching(el, 'form')) m = el;
+        if (!m || isMasked(m) || m.isContentEditable || document.designMode === 'on') return;
+        var cls = String(m.getAttribute('class') || '');
+        var role = m.getAttribute('role');
+        var live = m.getAttribute('aria-live');
+        var invalid = m.getAttribute('aria-invalid') === 'true';
+        // A control is never the message (its own text is what was typed); one marked invalid points to its message.
+        if (!invalid && closestMatching(m, MSG_TYPED)) return;
+        var kind = invalid ? 'field_error' : role === 'alert' || live === 'assertive' ? 'alert' : role === 'status' || live === 'polite' ? 'status' : 'field_error';
+        var shown = invalid ? document.getElementById((m.getAttribute('aria-errormessage') || m.getAttribute('aria-describedby') || '').split(' ')[0]) : m;
+        if (!shown || isMasked(shown) || shown.isContentEditable || closestMatching(shown, MSG_TYPED) || shown.querySelector('[data-sq-mask], [data-sq-private]')) return;
+        // The bounded walk of click text: no textarea/select content, no editable or masked part; cut before any rewrite.
+        var text = subtreeText(shown, MSG_TYPED).slice(0, 500).replace(/\s+/g, ' ').replace(/^ | $/g, '').toLowerCase();
+        // Read again only when its text changed ("Saving…" → "Network error" in one window is two messages).
+        if (!text || (msgExamined && msgExamined.get(m) === text)) return;
+        if (msgExamined) msgExamined.set(m, text);
+        var cl = 'other';
+        var t0 = now();
+        for (var i = 0; i < msgRules.length; i++) {
+          if (msgRules[i][1].test(text)) {
+            cl = msgRules[i][0];
+            break;
+          }
+        }
+        // A pattern this slow on this page: no detector for the rest of the page.
+        if (now() - t0 > 5) msgRules = null;
+        if (!MSG_CLASSES.test(cl)) cl = 'other';
+        var near = closestMatching(m, 'form') || (invalid ? m : closestMatching(m, 'dialog, section, main') || m);
+        var props = {
+          $msg_kind: kind,
+          $msg_tone: /error|danger|invalid/i.test(cls) ? 'error' : /warn/i.test(cls) ? 'warning' : /success/i.test(cls) ? 'success' : kind === 'status' ? 'info' : 'error',
+          $msg_class: cl,
+          $msg_near: cap(msgNear(near, near === m), EL_SELECTOR_MAX),
+          $msg_after: after,
+          $msg_len: text.length <= 40 ? 'short' : text.length <= 160 ? 'medium' : 'long'
+        };
+        var t = now();
+        var key = kind + ' ' + props.$msg_near + ' ' + cl;
+        if (msgSeen[key] > t - 10000) return;
+        msgSeen[key] = t;
+        while (msgTimes.length && msgTimes[0] <= t - 60000) msgTimes.shift();
+        // 10 per page view, 30 per minute; past either, one 'capped'.
+        if (msgView >= 10 || msgTimes.length >= 30) {
+          if (msgCapped) return;
+          msgCapped = true;
+          props.$msg_class = 'capped';
+        }
+        msgView++;
+        msgTimes.push(t);
+        captureInternal('$ui_message', props);
+      } catch (e) {}
+    }
+
     function onScroll() {
       if (dead || rage) effect(false);
     }
@@ -1889,10 +2032,11 @@
       try {
         var target = ev && ev.target;
         if (!target || tagNameOf(target) !== 'form') return;
+        openMsg('submit');
 
         captureInternal('$form_submit', {
           $form_selector: cap(stableSelector(target), EL_SELECTOR_MAX),
-          form: target.id ? cap(String(target.id), EL_ID_MAX) : undefined
+          form: idToken(target.id) || undefined
         });
       } catch (e) {}
     }
@@ -1901,9 +2045,10 @@
     document.addEventListener('submit', onSubmit, true);
     document.addEventListener('pointerdown', onPointerDown, true);
     document.addEventListener('pointerup', onPointerUp, true);
-    document.addEventListener('pointerup', onGesture, true);
-    document.addEventListener('touchend', onGesture, true);
-    document.addEventListener('keydown', onGesture, true);
+    // Window capture: the first stop of every event, so the gesture is marked before a page handler that clicks (#1173).
+    window.addEventListener('pointerup', onGesture, true);
+    window.addEventListener('touchend', onGesture, true);
+    window.addEventListener('keydown', onGesture, true);
     document.addEventListener('focusin', onFocusIn, true);
     document.addEventListener('selectionchange', onSelectionChange, true);
     document.addEventListener('scroll', onScroll, true);
@@ -2076,6 +2221,7 @@
             syncContextCookie();
             if (config && config.redaction) installRedactor(config.redaction);
 
+            uiMessages = config && config.ui_messages;
             if (AUTOCAPTURE_ENABLED) startAutocapture(attachUrl);
             bootRecorder(config);
           } catch (e) {}
