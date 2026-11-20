@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.5
+
+- On-screen messages (`$ui_message`) count only what the person can see. A region that is `display:none`,
+  `visibility:hidden` or `collapse`, marked `aria-busy="true"` (still loading), or visually hidden (positioned absolutely or
+  fixed and at most 1 pixel wide or high, as `.sr-only` classes do) sends nothing, and text inside such a part of a region is
+  not read. A loading skeleton announced to screen readers is no longer sent as a message. Styles are read only for a region
+  whose text just changed, never for every element on the page.
+
 ## 1.0.4
 
 - The person's own pointerup, touchend or keydown is noted on the window, before any handler of the page runs. So a click

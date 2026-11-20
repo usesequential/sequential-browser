@@ -1361,7 +1361,16 @@
     return !!closestMatching(el, '[data-sq-mask], [data-sq-private]');
   }
 
-  // skip (the message detector's MSG_TYPED): also leave out what matches it, or what the browser says is editable.
+  // D1 is a message the person SEES: display:none, visibility hidden, aria-busy (still loading), or visually hidden
+  // (absolute/fixed and <= 1px wide or high: .sr-only) is unseen; up: the ancestors too. A loading skeleton is no message.
+  function unseen(el, up) {
+    for (; el && el.nodeType === 1; el = up ? el.parentNode : null) {
+      var s = window.getComputedStyle(el);
+      if (s.display == 'none' || /hid|col/.test(s.visibility) || el.getAttribute('aria-busy') == 'true' || (/^(abs|fix)/.test(s.position) && (parseFloat(s.width) <= 1 || parseFloat(s.height) <= 1))) return 1;
+    }
+  }
+
+  // skip (the message detector's MSG_TYPED): also leave out what matches it, what the browser says is editable, or unseen.
   function subtreeText(el, skip) {
     var out = '';
     function visit(node) {
@@ -1375,7 +1384,7 @@
         if (inList(TEXT_OPAQUE_TAGS, tagNameOf(child))) continue;
         if (isEditable(child)) continue;
         if (child.hasAttribute && (child.hasAttribute('data-sq-mask') || child.hasAttribute('data-sq-private'))) continue;
-        if (skip && (child.isContentEditable === true || matchesSelector(child, skip))) continue;
+        if (skip && (child.isContentEditable === true || matchesSelector(child, skip) || unseen(child))) continue;
         visit(child);
       }
     }
@@ -1974,6 +1983,8 @@
         // Read again only when its text changed ("Saving…" → "Network error" in one window is two messages).
         if (!text || (msgExamined && msgExamined.get(m) === text)) return;
         if (msgExamined) msgExamined.set(m, text);
+        // Only now, for a candidate with new text: is the region itself seen (its ancestors' styles, once per new text)?
+        if (unseen(shown, 1)) return;
         var cl = 'other';
         var t0 = now();
         for (var i = 0; i < msgRules.length; i++) {
